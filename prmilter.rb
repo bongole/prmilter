@@ -73,7 +73,49 @@ module PRMilter
 
 	MILTER_LEN_BYTES = 4  # from sendmail's include/libmilter/mfdef.h
 
-	class MilterConnectionHandler < EM:Connection
+	ACTION_ADDHDRS    = 1  # 0x01 SMFIF_ADDHDRS    # Add headers
+	ACTION_CHGBODY    = 2  # 0x02 SMFIF_CHGBODY    # Change body chunks
+	ACTION_ADDRCPT    = 4  # 0x04 SMFIF_ADDRCPT    # Add recipients
+	ACTION_DELRCPT    = 8  # 0x08 SMFIF_DELRCPT    # Remove recipients
+	ACTION_CHGHDRS    = 16 # 0x10 SMFIF_CHGHDRS    # Change or delete headers
+	ACTION_QUARANTINE = 32 # 0x20 SMFIF_QUARANTINE # Quarantine message
+
+	class Milter
+		def initialize
+			@body = ''
+		end
+
+		def opt_neg( ver, actions, protocol )
+			_actions = 0b110000000
+			_protocol = ACTION_CHGBODY
+			return SMFIC_OPTNEG + [ MILTER_VERSION, _actions, _protocol].pack("NNN") 
+		end
+
+		def header( k,v )
+			return Response.continue
+		end
+
+		def body( data )
+			@body << data
+			return Response.continue
+		end
+
+		class Response
+			class << self
+				def continue
+					RESPONSE['CONTINUE']
+				end
+
+				def replace_body( body )
+					RESPONSE["REPLBODY"] + body + "\0"
+				end
+			end
+		end
+	end
+
+	class MilterConnectionHandler < EM::Connection
+		@@milter_class = Milter
+
 		def initialize
 			@data = ''
 			@milter = @@milter_class.new
@@ -83,28 +125,14 @@ module PRMilter
 			r = [ res.size ].pack('N') + res
 			send_data(r)
 		end
-		SMFIC_ABORT =>  'abort',
-		SMFIC_BODY =>  'body',
-		SMFIC_CONNECT =>  'connect',
-		SMFIC_MACRO =>  'macro',
-		SMFIC_BODYEOB =>  'end_body',
-		SMFIC_HELO =>  'helo',
-		SMFIC_HEADER =>  'header',
-		SMFIC_MAIL =>  'mail_from',
-		SMFIC_EOH =>  'end_headers',
-		SMFIC_OPTNEG =>  'opt_neg',
-		SMFIC_RCPT =>  'rcpt_to',
-		SMFIC_QUIT =>  'quit',
-		SMFIC_DATA =>  'data',
-		SMFIC_UNKNOWN =>  'unknown',
 
 		def parse_opt_neg( data )
-			ver, actions, protocol = data.pack('NNN')
+			ver, actions, protocol = data.unpack('NNN')
 			return [ver, actions, protocol]
 		end
 
 		def parse_macro( data )
-			macro, val  = data[0], data[1..-1]
+			macro, val  = data[0].chr, data[1..-1]
 			return [macro, val]
 		end
 
@@ -117,7 +145,7 @@ module PRMilter
 		end
 
 		def parse_helo( data )
-			return [data]_
+			return [data]
 		end
 
 		def parse_mail_from( data )
@@ -130,8 +158,31 @@ module PRMilter
 			return [mailfrom, esmtp_info.split("\0")]
 		end
 
-		#TODO make parse_*
-		#
+		def parse_header( data )
+			k,v = data.split("\0", 2)
+			return [k, v.delete("\0")]
+		end
+
+		def parse_end_headers( data )
+			return []
+		end
+
+		def parse_body( data )
+			return [ data.delete("\0") ]
+		end
+
+		def parse_end_body( data )
+			return []
+		end
+
+		def prase_quit( data )
+			return []
+		end
+
+		def parse_abort( data )
+			return []
+		end
+
 		def receive_data( data )
 			@data << data
 			while @data.size >= MILTER_LEN_BYTES
@@ -139,33 +190,48 @@ module PRMilter
 				if @data.size >= MILTER_LEN_BYTES + pkt_len
 					@data.slice!(0, MILTER_LEN_BYTES)
 					pkt = @data.slice!(0, pkt_len)
-					cmd, val = pkt[0], pkt[1..-1] 
+					cmd, val = pkt[0].chr, pkt[1..-1] 
 
-					if COMMANDS.include?(cmd) adn @milter.responde_to?(COMMANDS[cmd])
+					if cmd == SMFIC_QUIT
+						close_connection
+						return
+					end
+
+					if COMMANDS.include?(cmd) and @milter.respond_to?(COMMANDS[cmd])
 						method_name = COMMANDS[cmd]
 						args = []
-						args = self.send('parse_' + method_name, val ) if self.responde_to?('parse_' + method_name )
+						args = self.send('parse_' + method_name, val ) if self.respond_to?('parse_' + method_name )
 						ret = @milter.send(method_name, *args )
+
+						next if cmd == SMFIC_MACRO
 
 						if not ret.is_a? Array
 							ret = [ ret ]
 						end
 
 						ret.each do |r|
-							send_milter_response(ret)
+							send_milter_response(r)
 						end
 					else
+						next if cmd == SMFIC_MACRO
+						send_milter_response(RESPONSE['CONTINUE'])
 					end
 				else
 					break
 				end
 			end
 		end
+
+		class << self
+			def register( milter_class )
+				@@milter_class = milter_class
+			end
+		end
 	end
 
 	class << self
 		def register( milter_class )
-			@@milter_class = milter_class
+			MilterConnectionHandler.register(milter_class)
 		end
 
 		def start( host = 'localhost', port = 8888 )
@@ -176,3 +242,21 @@ module PRMilter
 	end
 end
 
+if $0 == __FILE__
+	# example
+	# change mail body
+	class MyMilter < PRMilter::Milter
+		def header( k,v )
+			puts "#{k} => #{v}"
+			return Response.continue
+		end
+
+		def end_body( *args )
+			puts "BODY => #{@body}"
+			return [Response.replace_body("hogehoge"), Response.continue]
+		end
+	end
+
+	PRMilter.register(MyMilter)
+	PRMilter.start
+end
